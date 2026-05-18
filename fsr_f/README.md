@@ -10,7 +10,7 @@ pip3 install unicorn
 
 ## Usage
 
-Pass path of dump's onenand.bin as first arg
+Pass path of dump's onenand.bin, onenand_slc.bin or onenand_mlc.bin as first arg
 
 Optional second arg can be provided for using a different bootloader (addresses may be needed to be added)
 

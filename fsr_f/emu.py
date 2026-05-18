@@ -6,7 +6,9 @@ import sys
 
 
 SEPARATION_SLC = 0
+SEPARATION_FLEX = 2
 SLC_PAGES_PER_BLOCK = 64
+MLC_PAGES_PER_BLOCK = 128
 
 BOOTLOADER_ADDRESES = {
     "C_D1_006 2010/08/18": {
@@ -41,7 +43,10 @@ class OnenandFlash:
         self.onenand = onenand
         self.onenand_bin = open(image_path + ".bin", "rb")
         self.onenand_oob = open(image_path + ".oob", "rb")
-        self.pages_per_block = SLC_PAGES_PER_BLOCK
+        if image_path.endswith("_mlc"):
+            self.pages_per_block = MLC_PAGES_PER_BLOCK
+        else:
+            self.pages_per_block = SLC_PAGES_PER_BLOCK
 
         self.size = self.onenand_bin.seek(0, os.SEEK_END)
         self.blocks = self.size // (self.pages_per_block * self.onenand.page_size)
@@ -63,7 +68,9 @@ class Onenand:
     def __init__(self):
         self.debug = envflag_set("DEBUG_NAND")
         self.debug_trace = self.debug and os.environ["DEBUG_NAND"].lower() == "trace"
+        self.int_reads = 0
 
+        self.onenand_mlc = None
         self.onenand_slc = None
 
         self.syscfg1 = 0xE6C4
@@ -80,6 +87,8 @@ class Onenand:
 
         self.start_buf_reg = 0
 
+        self.pi_mode = False
+        self.partition_information = bytearray(b"\xFF" * self.page_size * SLC_PAGES_PER_BLOCK)
         self.int = 0
         self.dataram = bytearray(self.page_size)
         self.spareram = bytearray(self.spare_size)
@@ -91,19 +100,50 @@ class Onenand:
         if not os.path.exists(image_path + ".bin"):
             self.print_debug("Image not found: '{:}.bin'".format(image_path))
             return
-        self.print_debug("SLC image: '{:}.bin'".format(image_path))
-        self.onenand_slc = OnenandFlash(self, image_path)
+        if image_path.endswith("_mlc"):
+            self.print_debug("MLC image: '{:}.bin'".format(image_path))
+            self.onenand_mlc = OnenandFlash(self, image_path)
+        else:
+            # both onenand_slc and onenand fall here
+            self.print_debug("SLC image: '{:}.bin'".format(image_path))
+            self.onenand_slc = OnenandFlash(self, image_path)
+
+    def _get_boundary_address(self):
+        # Return the configured boundary block where SLC ends 
+        # 0 means only 1'st block is SLC and rest is MLC
+        return struct.unpack_from("<H", self.partition_information, 0)[0] & 0xFFF
 
     def open(self, image_path):
-        self._open_image(image_path)
+        if image_path.endswith("_slc") or image_path.endswith("_mlc"):
+            image_path_base = image_path.removesuffix("slc").removesuffix("mlc")
+            image_path_slc = image_path_base + "slc"
+            image_path_mlc = image_path_base + "mlc"
 
-        # Compute total size in bytes
+            self._open_image(image_path_slc)
+            self._open_image(image_path_mlc)
+
+            if self.onenand_slc and self.onenand_mlc:
+                # This is a FlexNand dump
+                self.did |= SEPARATION_FLEX << 8
+        else:
+            # SLC
+            self._open_image(image_path)
+
         total_size = 0
         separation = (self.did >> 8) & 0b11
-        if self.onenand_slc:
+        if self.onenand_slc and self.onenand_mlc:
+            assert separation == SEPARATION_FLEX
+            separation_str = "Flex-OneNAND"
+            total_size = self.onenand_slc.size + self.onenand_mlc.size
+            # I assume this is for PI
+            total_size += SLC_PAGES_PER_BLOCK * self.page_size
+        elif self.onenand_slc:
             assert separation == SEPARATION_SLC
             separation_str = "SLC"
             total_size = self.onenand_slc.size
+        elif self.onenand_mlc:
+            print("Currently unimplemented OneNand configuration (MLC)")
+            os._exit(-1)
         else:
             print("No image loaded?")
             os._exit(-1)
@@ -131,6 +171,17 @@ class Onenand:
         self.print_debug("* DeviceID [7:4]  Density:       {:04b} = {}".format((self.did >> 4) & 0xF, total_size))
         self.print_debug("* DeviceID [9:8]  Separation:    {:02b} = {}".format(separation, separation_str))
 
+        if self.onenand_slc and self.onenand_mlc:
+            assert 0 < self.onenand_slc.blocks
+            # Program the alloc word with the boundary of SLC / MLC
+            alloc = self.onenand_slc.blocks - 1
+            if 0xFFFF < alloc:
+                self.print_debug("Warning: Alloc value beyond max! wrong files? 0x{:04X}", alloc)
+                alloc = 0xFFFF
+            struct.pack_into("<H", self.partition_information, 0, alloc)
+
+        self.print_debug("* Boundary block: 0x{:04X}".format(self._get_boundary_address()))
+
     def print_debug(self, *args, **kwargs):
         if self.debug:
             print(*args, **kwargs)
@@ -145,11 +196,32 @@ class Onenand:
 
         page_in_block = self.start_addr_8 >> 2
 
-        if (self.start_addr_1, self.start_addr_8) in self.override_page:
-            self.dataram = bytearray(self.override_page[(self.start_addr_1, page_in_block)])
-            self.spareram = bytearray(self.override_spare[(self.start_addr_1, page_in_block)])
-        else:
-            self.onenand_slc.read_page(uc, self.start_addr_1, page_in_block)
+        if self.pi_mode:
+            # Partition Information only has a single SLC block with no ECC
+            if self.start_addr_1 != 0:
+                print("Tried to access non 0 block while in PI mode")
+                abort(uc)
+            if (self.syscfg1 & 0x100) == 0:
+                print("PI access must have ECC off")
+                abort(uc)
+            off = self.page_size * page_in_block
+            self.dataram = bytearray(
+                self.partition_information[off : off + self.page_size]
+            )
+        elif (self.start_addr_1, self.start_addr_8) in self.override_page:
+            self.dataram = bytearray(
+                self.override_page[(self.start_addr_1, page_in_block)]
+            )
+            self.spareram = bytearray(
+                self.override_spare[(self.start_addr_1, page_in_block)]
+            )
+        elif self.onenand_slc:
+            slc_blocks = self.onenand_slc.blocks
+            if self.onenand_mlc and slc_blocks <= self.start_addr_1:
+                block = self.start_addr_1 - slc_blocks
+                self.onenand_mlc.read_page(uc, block, page_in_block)
+            else:
+                self.onenand_slc.read_page(uc, self.start_addr_1, page_in_block)
 
     def read_reg(self, uc, offset, size):
         if self.debug_trace and (offset < 0x404 or 0x1400 < offset):
@@ -164,6 +236,12 @@ class Onenand:
         elif offset == 0x1E442:
             return self.syscfg1
         elif offset == 0x1E482:
+            self.int_reads += 1
+            if self.int_reads > 100:
+                # Pretend its busy until we set flag if its reading INT constantly
+                # This seems to be required as in FlexNAND mode the bootloader waits
+                # for a while unless its set
+                self.int |= 0x8000
             return self.int
         elif size == 4 and offset >= 0x400 and offset < 0x1400:
             return struct.unpack_from("<I", self.dataram[offset - 0x400 :])[0]
@@ -206,6 +284,10 @@ class Onenand:
             if value == 0x65:
                 self.print_debug("OneNAND CMD: OTP read")
                 self.int = 0x8000
+            elif value == 0x66:
+                self.print_debug("OneNAND CMD: PI mode")
+                self.pi_mode = True
+                self.int = 0x8000
             elif value == 0x00 or value == 0x03:
                 self.print_debug("OneNAND CMD: Read A1 0x{:X}, A2 0x{:X}, A8 0x{:X})".format(
                     self.start_addr_1, self.start_addr_2, self.start_addr_8
@@ -215,6 +297,9 @@ class Onenand:
                 self.int = 0x8080
             elif value == 0xF0:
                 self.print_debug("OneNAND CMD: Reset flash core")
+                if self.pi_mode:
+                    self.print_debug("Leaving PI mode")
+                    self.pi_mode = False
                 self.int = 0x8010
             elif value == 0x23:
                 self.print_debug("OneNAND CMD: Unlock NAND array a block")
@@ -222,9 +307,13 @@ class Onenand:
             elif value == 0x94:
                 # Erase block
                 self.print_debug("OneNAND CMD: Erase block 0x{:X}".format(self.start_addr_1))
-                for x in range(SLC_PAGES_PER_BLOCK):
-                    self.override_page[(self.start_addr_1, x)] = b"\xFF" * self.page_size
-                    self.override_spare[(self.start_addr_1, x)] = b"\xFF" * self.spare_size
+                if self.pi_mode:
+                    self.partition_information = bytearray(b"\xff" * self.page_size)
+                else:
+                    # Use MLC amount since is bigger
+                    for x in range(MLC_PAGES_PER_BLOCK):
+                        self.override_page[(self.start_addr_1, x)] = b"\xFF" * self.page_size
+                        self.override_spare[(self.start_addr_1, x)] = b"\xFF" * self.spare_size
                 self.int = 0xFFFF
             elif value == 0x80:
                 # Program page
@@ -233,9 +322,17 @@ class Onenand:
                     self.start_addr_1, page_in_block
                 ))
                 assert self.start_addr_8 % 4 == 0
-                page_in_block = self.start_addr_8 // 4
-                self.override_page[(self.start_addr_1, page_in_block)] = self.dataram
-                self.override_spare[(self.start_addr_1, page_in_block)] = self.spareram
+                if self.pi_mode:
+                    off = page_in_block * self.page_size
+                    self.partition_information = (
+                        self.partition_information[:off]
+                        + self.dataram
+                        + self.partition_information[off + self.page_size :]
+                    )
+                    assert len(self.partition_information) == (self.page_size * SLC_PAGES_PER_BLOCK)
+                else:
+                    self.override_page[(self.start_addr_1, page_in_block)] = self.dataram
+                    self.override_spare[(self.start_addr_1, page_in_block)] = self.spareram
                 self.int = 0xFFFF
             else:
                 print("onenand_write UNKNOWN CMD REG value=0x{:X}".format(value))
