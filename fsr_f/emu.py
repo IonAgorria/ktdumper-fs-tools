@@ -361,6 +361,17 @@ def onenand_write(uc, offset, size, value, data):
     onenand.write_reg(uc, offset, size, value)
 
 
+def print_mem(uc, target_addr, pre = 2, post = 2):
+    for addr in range(target_addr - pre * 0x10, target_addr + (post + 1) * 0x10, 0x10):
+        marker = "    "
+        if target_addr == addr:
+            marker = ">>> "
+        vals = struct.unpack("<IIII", uc.mem_read(addr, 0x10))
+        print("{:} [0x{:08X}] 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}".format(
+            marker, addr, vals[0], vals[1], vals[2], vals[3]
+        ))
+
+
 def print_regs(uc):
     regs = [
         ("r0", UC_ARM_REG_R0),
@@ -377,13 +388,18 @@ def print_regs(uc):
         ("r11", UC_ARM_REG_R11),
         ("r12", UC_ARM_REG_R12),
         ("lr", UC_ARM_REG_LR),
-        ("pc", UC_ARM_REG_PC),
-        ("sp", UC_ARM_REG_SP),
     ]
 
     for name, reg in regs:
         print(">>> {} : 0x{:08X}".format(name, uc.reg_read(reg)))
 
+    reg_pc = uc.reg_read(UC_ARM_REG_PC)
+    print(">>> pc : 0x{:08X}".format(reg_pc))
+    print_mem(uc, reg_pc, 1, 1)
+
+    reg_sp = uc.reg_read(UC_ARM_REG_SP)
+    print(">>> sp : 0x{:08X}".format(reg_sp))
+    print_mem(uc, reg_sp, 2, 2)
 
 def post_print(uc, address, size, user_data):
     data = uc.mem_read(BOOTLOADER_ADDRESES[user_data]["printf_result"], 0x2000)
